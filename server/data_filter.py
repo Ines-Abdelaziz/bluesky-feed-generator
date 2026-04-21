@@ -1,98 +1,76 @@
-import datetime
+import csv
+import os
+from datetime import datetime, timezone
 
-from collections import defaultdict
-
-from atproto import models
-
-from server import config
 from server.logger import logger
-from server.database import db, Post
+
+# ---------------------------------------------------------------------------
+# Load allowed source DIDs from CSV at startup
+# ---------------------------------------------------------------------------
 
 
-def is_archive_post(record: 'models.AppBskyFeedPost.Record') -> bool:
-    # Sometimes users will import old posts from Twitter/X which con flood a feed with
-    # old posts. Unfortunately, the only way to test for this is to look an old
-    # created_at date. However, there are other reasons why a post might have an old
-    # date, such as firehose or firehose consumer outages. It is up to you, the feed
-    # creator to weigh the pros and cons, amd and optionally include this function in
-    # your filter conditions, and adjust the threshold to your liking.
-    #
-    # See https://github.com/MarshalX/bluesky-feed-generator/pull/21
-
-    archived_threshold = datetime.timedelta(days=1)
-    created_at = datetime.datetime.fromisoformat(record.created_at)
-    now = datetime.datetime.now(datetime.UTC)
-
-    return now - created_at > archived_threshold
-
-
-def should_ignore_post(created_post: dict) -> bool:
-    record = created_post['record']
-    uri = created_post['uri']
-
-    if config.IGNORE_ARCHIVED_POSTS and is_archive_post(record):
-        logger.debug(f'Ignoring archived post: {uri}')
-        return True
-
-    if config.IGNORE_REPLY_POSTS and record.reply:
-        logger.debug(f'Ignoring reply post: {uri}')
-        return True
-
-    return False
+def _load_sources(csv_path: str) -> dict[str, str]:
+    """
+    Returns a dict of {did: bias} for all accounts in the CSV.
+    Adjust csv_path to wherever you place your bluesky_sources.csv.
+    """
+    sources = {}
+    if not os.path.exists(csv_path):
+        logger.warning(f"Sources CSV not found at {csv_path}")
+        return sources
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            did = row.get("did", "").strip()
+            bias = row.get("bias", "unknown").strip()
+            if did:
+                sources[did] = bias
+    logger.info(f"Loaded {len(sources)} source DIDs from {csv_path}")
+    return sources
 
 
-def operations_callback(ops: defaultdict) -> None:
-    # Here we can filter, process, run ML classification, etc.
-    # After our feed alg we can save posts into our DB
-    # Also, we should process deleted posts to remove them from our DB and keep it in sync
+# Path to your CSV — adjust if needed
+CSV_PATH = os.path.join(os.path.dirname(__file__), "..", "bluesky_sources.csv")
+ALLOWED_SOURCES: dict[str, str] = _load_sources(CSV_PATH)
 
-    # for example, let's create our custom feed that will contain all posts that contains 'python' related text
+# ---------------------------------------------------------------------------
+# Optional: filter by bias label
+# Set to None to include all bias categories, or e.g. {'neutral', 'left-center'}
+# ---------------------------------------------------------------------------
+ALLOWED_BIASES: set[str] | None = None  # e.g. {'neutral'} to restrict
+
+# ---------------------------------------------------------------------------
+# Main callback — called for every firehose event
+# ---------------------------------------------------------------------------
+
+
+def operations_callback(ops: dict) -> None:
+    from server.database import Post  # local import to avoid circular deps
 
     posts_to_create = []
-    for created_post in ops[models.ids.AppBskyFeedPost]['created']:
-        author = created_post['author']
-        record = created_post['record']
 
-        post_with_images = isinstance(record.embed, models.AppBskyEmbedImages.Main)
-        post_with_video = isinstance(record.embed, models.AppBskyEmbedVideo.Main)
-        inlined_text = record.text.replace('\n', ' ')
+    for post in ops.get("posts", {}).get("creates", []):
+        author_did = post.get("author", "")
+        uri = post.get("uri", "")
+        cid = post.get("cid", "")
 
-        # print all texts just as demo that data stream works
-        logger.debug(
-            f'NEW POST '
-            f'[CREATED_AT={record.created_at}]'
-            f'[AUTHOR={author}]'
-            f'[WITH_IMAGE={post_with_images}]'
-            f'[WITH_VIDEO={post_with_video}]'
-            f': {inlined_text}'
-        )
-
-        if should_ignore_post(created_post):
+        # Skip if author is not in our source list
+        if author_did not in ALLOWED_SOURCES:
             continue
 
-        # only python-related posts
-        if 'python' in record.text.lower():
-            reply_root = reply_parent = None
-            if record.reply:
-                reply_root = record.reply.root.uri
-                reply_parent = record.reply.parent.uri
+        # Optional: filter by bias category
+        if ALLOWED_BIASES is not None:
+            bias = ALLOWED_SOURCES[author_did]
+            if bias not in ALLOWED_BIASES:
+                continue
 
-            post_dict = {
-                'uri': created_post['uri'],
-                'cid': created_post['cid'],
-                'reply_parent': reply_parent,
-                'reply_root': reply_root,
+        posts_to_create.append(
+            {
+                "uri": uri,
+                "cid": cid,
+                "indexed_at": datetime.now(timezone.utc).isoformat(),
             }
-            posts_to_create.append(post_dict)
-
-    posts_to_delete = ops[models.ids.AppBskyFeedPost]['deleted']
-    if posts_to_delete:
-        post_uris_to_delete = [post['uri'] for post in posts_to_delete]
-        Post.delete().where(Post.uri.in_(post_uris_to_delete)).execute()
-        logger.debug(f'Deleted from feed: {len(post_uris_to_delete)}')
+        )
 
     if posts_to_create:
-        with db.atomic():
-            for post_dict in posts_to_create:
-                Post.create(**post_dict)
-        logger.debug(f'Added to feed: {len(posts_to_create)}')
+        logger.debug(f"Indexing {len(posts_to_create)} posts from allowed sources")
+        Post.insert_many(posts_to_create).on_conflict_ignore().execute()
