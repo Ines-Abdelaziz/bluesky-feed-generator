@@ -14,13 +14,18 @@ app = Flask(__name__)
 
 stream_stop_event = threading.Event()
 stream_thread = threading.Thread(
-    target=data_stream.run, args=(config.SERVICE_DID, operations_callback, stream_stop_event,)
+    target=data_stream.run,
+    args=(
+        config.SERVICE_DID,
+        operations_callback,
+        stream_stop_event,
+    ),
 )
 stream_thread.start()
 
 
 def sigint_handler(*_):
-    print('Stopping data stream...')
+    print("Stopping data stream...")
     stream_stop_event.set()
     sys.exit(0)
 
@@ -28,48 +33,59 @@ def sigint_handler(*_):
 signal.signal(signal.SIGINT, sigint_handler)
 
 
-@app.route('/')
+@app.route("/")
 def index():
-    return 'ATProto Feed Generator powered by The AT Protocol SDK for Python (https://github.com/MarshalX/atproto).'
+    return """
+    <html>
+    <body>
+        <p>This is a research feed generator operated by the 
+        Networked Systems group at MPI-SWS. 
+        It is not intended for public use.</p>
+        <p>
+            <a href="https://imprint.mpi-klsb.mpg.de/sws/feedaudit.mpi-sws.org">Imprint</a> | 
+            <a href="https://data-protection.mpi-klsb.mpg.de/sws/feedaudit.mpi-sws.org">Data Protection</a>
+        </p>
+    </body>
+    </html>
+    """
 
 
-@app.route('/.well-known/did.json', methods=['GET'])
+@app.route("/.well-known/did.json", methods=["GET"])
 def did_json():
     if not config.SERVICE_DID.endswith(config.HOSTNAME):
-        return '', 404
+        return "", 404
 
-    return jsonify({
-        '@context': ['https://www.w3.org/ns/did/v1'],
-        'id': config.SERVICE_DID,
-        'service': [
-            {
-                'id': '#bsky_fg',
-                'type': 'BskyFeedGenerator',
-                'serviceEndpoint': f'https://{config.HOSTNAME}'
-            }
-        ]
-    })
-
-
-@app.route('/xrpc/app.bsky.feed.describeFeedGenerator', methods=['GET'])
-def describe_feed_generator():
-    feeds = [{'uri': uri} for uri in algos.keys()]
-    response = {
-        'encoding': 'application/json',
-        'body': {
-            'did': config.SERVICE_DID,
-            'feeds': feeds
+    return jsonify(
+        {
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": config.SERVICE_DID,
+            "service": [
+                {
+                    "id": "#bsky_fg",
+                    "type": "BskyFeedGenerator",
+                    "serviceEndpoint": f"https://{config.HOSTNAME}",
+                }
+            ],
         }
+    )
+
+
+@app.route("/xrpc/app.bsky.feed.describeFeedGenerator", methods=["GET"])
+def describe_feed_generator():
+    feeds = [{"uri": uri} for uri in algos.keys()]
+    response = {
+        "encoding": "application/json",
+        "body": {"did": config.SERVICE_DID, "feeds": feeds},
     }
     return jsonify(response)
 
 
-@app.route('/xrpc/app.bsky.feed.getFeedSkeleton', methods=['GET'])
+@app.route("/xrpc/app.bsky.feed.getFeedSkeleton", methods=["GET"])
 def get_feed_skeleton():
-    feed = request.args.get('feed', default=None, type=str)
+    feed = request.args.get("feed", default=None, type=str)
     algo = algos.get(feed)
     if not algo:
-        return 'Unsupported algorithm', 400
+        return "Unsupported algorithm", 400
 
     # Example of how to check auth if giving user-specific results:
     """
@@ -81,10 +97,10 @@ def get_feed_skeleton():
     """
 
     try:
-        cursor = request.args.get('cursor', default=None, type=str)
-        limit = request.args.get('limit', default=20, type=int)
+        cursor = request.args.get("cursor", default=None, type=str)
+        limit = request.args.get("limit", default=20, type=int)
         body = algo(cursor, limit)
     except ValueError:
-        return 'Malformed cursor', 400
+        return "Malformed cursor", 400
 
     return jsonify(body)
